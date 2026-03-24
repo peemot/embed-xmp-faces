@@ -212,7 +212,10 @@ def is_duplicate_region(reg1: Dict[str, Any], reg2: Dict[str, Any]) -> bool:
 def encode_exiftool_struct(value: Any) -> str:
     """Encode Python dict/list structures in ExifTool's struct syntax."""
     if isinstance(value, dict):
-        parts = [f"{key}={encode_exiftool_struct(subvalue)}" for key, subvalue in value.items()]
+        parts = [
+            f"{key}={encode_exiftool_struct(subvalue)}"
+            for key, subvalue in value.items()
+        ]
         return "{" + ",".join(parts) + "}"
 
     if isinstance(value, list):
@@ -318,7 +321,9 @@ def build_metadata_map(
         source_paths.append(absolute_source)
         metadata_map[absolute_source] = item
 
-    duplicate_paths = [path for path, count in Counter(source_paths).items() if count > 1]
+    duplicate_paths = [
+        path for path, count in Counter(source_paths).items() if count > 1
+    ]
     if duplicate_paths:
         logger.error(
             "Pass 1 returned duplicate metadata entries: %s",
@@ -370,15 +375,15 @@ def read_pass(
         command = build_exiftool_command(
             read_args_file,
             base_args=[
-                "-q",
-                "-charset",
-                "utf8",
-                "-charset",
-                "filename=utf8",
-                "-j",
-                "-struct",
-                "-Subject",
-                "-RegionInfo",
+                "-q",             # Silence summary messages (e.g., "8 image files read")
+                "-charset",       # Set internal text encoding...
+                "utf8",           # ...to UTF-8 to correctly handle names with special characters
+                "-charset",       # Set file path encoding...
+                "filename=utf8",  # ...to UTF-8 so folders/files with Unicode characters don't crash
+                "-j",             # Format the output as a JSON string so Python can parse it
+                "-struct",        # Keep complex data (like face coordinates) as nested JSON objects
+                "-Subject",       # Limit extraction to ONLY the <dc:subject> tag
+                "-RegionInfo",    # Limit extraction to ONLY the Face Regions tag
             ],
         )
         result = run_exiftool(command, logger, "Pass 1")
@@ -454,7 +459,9 @@ def prepare_write_tasks(
 
         xmp_subjects = normalize_subjects(xmp_meta.get("Subject"))
         image_subjects = normalize_subjects(image_meta.get("Subject"))
-        xmp_region_info = safe_normalize_region_info(xmp_meta.get("RegionInfo"), xmp_path, logger)
+        xmp_region_info = safe_normalize_region_info(
+            xmp_meta.get("RegionInfo"), xmp_path, logger
+        )
         image_region_info = safe_normalize_region_info(
             image_meta.get("RegionInfo"), image_path, logger
         )
@@ -563,13 +570,19 @@ def write_pass(
 
         with open(write_args_file, "w", encoding="utf-8", newline="\n") as handle:
             for image_path, subjects, region_info in write_tasks:
+                
+                # ExifTool flag to clear all existing Subject values explicitly before inserting new ones.
                 handle.write("-Subject=\n")
+                
+                # Appends each new subject value one by one to a list tag. 
                 for subject in subjects:
                     handle.write(f"-Subject={subject}\n")
 
                 if region_info is None:
+                    # 'None' means we are merging and don't want to interfere with RegionInfo
                     pass
                 elif region_info:
+                    # Write complex JSON-like nested object into ExifTool struct formatting
                     encoded_region_info = encode_exiftool_struct(region_info)
                     logger.debug(
                         "--- EXIFTOOL STRUCT STRING ---\n%s\n------------------------------",
@@ -577,19 +590,26 @@ def write_pass(
                     )
                     handle.write(f"-RegionInfo={encoded_region_info}\n")
                 else:
+                    # If dict is explicitly empty, we clear the RegionInfo tag entirely
                     handle.write("-RegionInfo=\n")
 
+                # -efile options track success/failure states into separate text files. 
+                # This allows Python to read the exact execution results without parsing stdout manually.
                 handle.write("-efile\n")
-                handle.write(f"{errors_file}\n")
+                handle.write(f"{errors_file}\n")    # Logs files that failed/encountered errors
                 handle.write("-efile2\n")
-                handle.write(f"{unchanged_file}\n")
+                handle.write(f"{unchanged_file}\n") # Logs files evaluated but didn't require saving changes
                 handle.write("-efile8\n")
-                handle.write(f"{updated_file}\n")
+                handle.write(f"{updated_file}\n")   # Logs files successfully modified and saved
 
+                # Flag to prevent ExifTool from duplicating the original file into 'filename.jpg_original'
                 if not keep_original:
                     handle.write("-overwrite_original\n")
 
+                # Provide the target image path ExifTool needs to operate on for this block
                 handle.write(f"{image_path}\n")
+                
+                # Resets arguments for the next file iteration and forces immediate execution of the block above
                 handle.write("-execute\n")
 
         logger.debug("--- CONTENTS OF WRITE ARGUMENT FILE ---")
@@ -598,8 +618,14 @@ def write_pass(
 
         command = build_exiftool_command(
             write_args_file,
-            base_args=["-charset", "utf8", "-charset", "filename=utf8"],
-            common_args=["-charset", "utf8", "-charset", "filename=utf8"],
+            base_args=[
+                "-charset", "utf8",             # Use UTF-8 for parsing text structures
+                "-charset", "filename=utf8"     # Treat filenames as UTF-8 (vital for non-ASCII paths)
+            ],
+            common_args=[
+                "-charset", "utf8",             # -common_args persists across the internal "-execute" resets
+                "-charset", "filename=utf8"     # so we don't lose UTF-8 context after the 1st file writes
+            ],
         )
         result = run_exiftool(command, logger, "Pass 2")
         if result is None:
@@ -725,7 +751,9 @@ def main() -> int:
         return 0
 
     logger.info("Pass 2: Applying updates to %d files...", len(write_tasks))
-    success = write_pass(write_tasks, keep_original=args.keep_original, logger=logger)
+    success = write_pass(write_tasks,
+                         keep_original=args.keep_original,
+                         logger=logger)
     if success:
         logger.info("Run completed successfully. Check %s for details.", log_file)
         return 0
