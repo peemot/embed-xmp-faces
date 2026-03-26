@@ -79,15 +79,30 @@ def find_image_xmp_pairs(root_dir: str) -> List[Tuple[str, str]]:
     pairs: List[Tuple[str, str]] = []
 
     for dirpath, _, filenames in os.walk(root_dir):
+        if not filenames:
+            continue
+
+        filename_set = set(filenames)
+        # Create a lowercase mapping for case-insensitive lookup
+        lower_to_actual = {f.lower(): f for f in filenames}
+        abs_dirpath = os.path.abspath(dirpath)
+
         for filename in filenames:
             ext = os.path.splitext(filename)[1].lower()
             if ext not in VALID_EXTENSIONS:
                 continue
 
-            image_path = os.path.abspath(os.path.join(dirpath, filename))
-            xmp_path = image_path + ".xmp"
-            if os.path.exists(xmp_path):
-                pairs.append((image_path, os.path.abspath(xmp_path)))
+            # Look up the lowercased expected sidecar name in our map
+            expected_xmp_lower = f"{filename}.xmp".lower()
+            if expected_xmp_lower not in lower_to_actual:
+                continue
+                
+            # Grab the actual exact casing of the XMP file from the disk
+            actual_xmp_filename = lower_to_actual[expected_xmp_lower]
+
+            image_path = os.path.join(abs_dirpath, filename)
+            xmp_path = os.path.join(abs_dirpath, actual_xmp_filename)
+            pairs.append((image_path, xmp_path))
 
     return pairs
 
@@ -106,12 +121,18 @@ def normalize_list(data: Any) -> List[Any]:
 
 
 def normalize_subjects(data: Any) -> List[str]:
-    """Normalize Subject values while preserving order."""
+    """Normalize Subject values while preserving order and dropping blanks."""
     subjects: List[str] = []
     for item in normalize_list(data):
         if item is None:
             continue
-        subjects.append(str(item))
+
+        subject = str(item).strip()
+        if not subject:
+            continue
+
+        subjects.append(subject)
+
     return subjects
 
 
@@ -414,20 +435,104 @@ def read_pass(
             return None
 
         try:
-            raw_metadata = json.loads(result.stdout)
+            raw_metadata = json.loads(stdout_text)
         except json.JSONDecodeError as exc:
             logger.error("Failed to parse Pass 1 JSON output: %s", exc)
             return None
 
-        logger.debug(
-            "--- RAW READ METADATA ---\n%s\n-------------------------",
-            json.dumps(raw_metadata, indent=2, ensure_ascii=False),
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "--- RAW READ METADATA ---\n%s\n-------------------------",
+                json.dumps(raw_metadata, indent=2, ensure_ascii=False),
+            )
 
         return build_metadata_map(raw_metadata, expected_files, logger)
     finally:
         if os.path.exists(read_args_file):
             os.remove(read_args_file)
+
+
+def calculate_overlap_metrics(
+    area1: Dict[str, Any],
+    area2: Dict[str, Any],
+) -> Tuple[float, float]:
+    """Return (IoU, overlap fraction of the smaller box)."""
+    try:
+        x1, y1 = float(area1.get("X", 0)), float(area1.get("Y", 0))
+        w1, h1 = float(area1.get("W", 0)), float(area1.get("H", 0))
+
+        x2, y2 = float(area2.get("X", 0)), float(area2.get("Y", 0))
+        w2, h2 = float(area2.get("W", 0)), float(area2.get("H", 0))
+    except (TypeError, ValueError):
+        return 0.0, 0.0
+
+    if min(w1, h1, w2, h2) <= 0:
+        return 0.0, 0.0
+
+    # MWG Regions use X/Y as center point and W/H as dimensions.
+    l1, r1 = x1 - (w1 / 2), x1 + (w1 / 2)
+    t1, b1 = y1 - (h1 / 2), y1 + (h1 / 2)
+
+    l2, r2 = x2 - (w2 / 2), x2 + (w2 / 2)
+    t2, b2 = y2 - (h2 / 2), y2 + (h2 / 2)
+
+    inter_l = max(l1, l2)
+    inter_r = min(r1, r2)
+    inter_t = max(t1, t2)
+    inter_b = min(b1, b2)
+
+    if inter_l >= inter_r or inter_t >= inter_b:
+        return 0.0, 0.0
+
+    inter_area = (inter_r - inter_l) * (inter_b - inter_t)
+    area1_size = w1 * h1
+    area2_size = w2 * h2
+    union_area = area1_size + area2_size - inter_area
+
+    iou = (inter_area / union_area) if union_area > 0 else 0.0
+    smaller_overlap = inter_area / min(area1_size, area2_size)
+
+    return iou, smaller_overlap
+
+
+def is_significant_overlap(
+    reg1: Dict[str, Any],
+    reg2: Dict[str, Any],
+    threshold: float = 0.70,
+    containment_threshold: float = 0.85,
+) -> bool:
+    """Check if two regions likely describe the same face/object."""
+    type1 = str(reg1.get("Type", "")).strip().casefold()
+    type2 = str(reg2.get("Type", "")).strip().casefold()
+
+    # Only treat different explicit region types as non-conflicting.
+    if type1 and type2 and type1 != type2:
+        return False
+
+    area1 = reg1.get("Area") if isinstance(reg1.get("Area"), dict) else {}
+    area2 = reg2.get("Area") if isinstance(reg2.get("Area"), dict) else {}
+
+    iou, smaller_overlap = calculate_overlap_metrics(area1, area2)
+    return iou >= threshold or smaller_overlap >= containment_threshold
+
+
+def deduplicate_regions(regions: List[Dict[str, Any]], threshold: float = 0.70) -> List[Dict[str, Any]]:
+    """Remove overlapping duplicate regions, keeping the most recently added one."""
+    unique_regions = list()
+    
+    # Iterate in reverse so we keep the newest appended edits
+    for candidate in reversed(regions):
+        has_overlap = False
+        for accepted in unique_regions:
+            if is_significant_overlap(candidate, accepted, threshold):
+                has_overlap = True
+                break
+        
+        if not has_overlap:
+            unique_regions.append(candidate)
+            
+    # Reverse again to put them back in standard top-to-bottom order
+    return list(reversed(unique_regions))
 
 
 def prepare_write_tasks(
@@ -439,6 +544,20 @@ def prepare_write_tasks(
 ) -> List[WriteTask]:
     """Evaluate metadata and prepare final write operations."""
     write_tasks: List[WriteTask] = []
+
+    def subject_key(subject: str) -> str:
+        return subject.casefold()
+
+    def region_name_key(region: Dict[str, Any]) -> Optional[str]:
+        name = str(region.get("Name", "")).strip()
+        if not name:
+            return None
+
+        region_type = str(region.get("Type", "")).strip().casefold()
+        if region_type and region_type != "face":
+            return None
+
+        return subject_key(name)
 
     for image_path, xmp_path in pairs:
         image_meta = metadata_map.get(image_path)
@@ -473,6 +592,8 @@ def prepare_write_tasks(
             xmp_subjects, xmp_regions, include_unknown
         )
 
+        xmp_regions = deduplicate_regions(xmp_regions, threshold=0.70)
+
         if not xmp_subjects and not xmp_regions:
             logger.warning(
                 "Skipped %s: XMP sidecar contains no valid Subject or RegionInfo "
@@ -489,25 +610,77 @@ def prepare_write_tasks(
             )
             continue
 
+        xmp_seen_subjects = {subject_key(subject) for subject in xmp_subjects}
         for region in xmp_regions:
-            if region.get("Type") == "Face" and region.get("Name"):
-                name = str(region.get("Name")).strip()
-                if name and name not in xmp_subjects:
-                    xmp_subjects.append(name)
+            name = str(region.get("Name", "")).strip()
+            region_type = str(region.get("Type", "")).strip().casefold()
+
+            if not name:
+                continue
+            if region_type and region_type != "face":
+                continue
+
+            key = subject_key(name)
+            if key not in xmp_seen_subjects:
+                xmp_subjects.append(name)
+                xmp_seen_subjects.add(key)
+
+        final_regions = list(xmp_regions)
+        replaced_image_face_name_keys: Set[str] = set()
+
+        if merge:
+            for existing_region in image_regions:
+                winning_xmp_region: Optional[Dict[str, Any]] = None
+                for candidate_region in xmp_regions:
+                    if is_significant_overlap(
+                        candidate_region,
+                        existing_region,
+                        threshold=0.70,
+                    ):
+                        winning_xmp_region = candidate_region
+                        break
+
+                if winning_xmp_region is not None:
+                    old_name_key = region_name_key(existing_region)
+                    new_name_key = region_name_key(winning_xmp_region)
+                    if old_name_key and new_name_key:
+                        replaced_image_face_name_keys.add(old_name_key)
+                    continue
+
+                duplicate_existing = any(
+                    is_significant_overlap(
+                        candidate_region,
+                        existing_region,
+                        threshold=0.70,
+                    )
+                    for candidate_region in final_regions
+                )
+                if not duplicate_existing:
+                    final_regions.append(existing_region)
+
+        final_face_name_keys = {
+            key
+            for key in (region_name_key(region) for region in final_regions)
+            if key is not None
+        }
 
         final_subjects = list(image_subjects) if merge else []
-        for subject in xmp_subjects:
-            if subject not in final_subjects:
-                final_subjects.append(subject)
+        if merge and replaced_image_face_name_keys:
+            final_subjects = [
+                subject
+                for subject in final_subjects
+                if (
+                    subject_key(subject) not in replaced_image_face_name_keys
+                    or subject_key(subject) in final_face_name_keys
+                )
+            ]
 
-        final_regions = list(image_regions) if merge else []
-        for candidate_region in xmp_regions:
-            duplicate_found = any(
-                is_duplicate_region(candidate_region, existing_region)
-                for existing_region in final_regions
-            )
-            if not duplicate_found:
-                final_regions.append(candidate_region)
+        final_seen_subjects = {subject_key(subject) for subject in final_subjects}
+        for subject in xmp_subjects:
+            key = subject_key(subject)
+            if key not in final_seen_subjects:
+                final_subjects.append(subject)
+                final_seen_subjects.add(key)
 
         final_region_info: Dict[str, Any] = {}
         dimensions = xmp_region_info.get("AppliedToDimensions")
@@ -518,12 +691,17 @@ def prepare_write_tasks(
         if final_regions:
             final_region_info["RegionList"] = final_regions
 
-        logger.debug(
-            "--- FINAL PREPARED REGION DICTIONARY FOR %s ---\n%s\n"
-            "---------------------------------------------------------",
-            os.path.basename(image_path),
-            json.dumps(final_region_info, indent=2, ensure_ascii=False),
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "--- FINAL PREPARED REGION DICTIONARY FOR %s ---\n%s\n"
+                "---------------------------------------------------------",
+                os.path.basename(image_path),
+                json.dumps(final_region_info, indent=2, ensure_ascii=False),
+            )
+
+        if merge and final_subjects == image_subjects and final_region_info == image_region_info:
+            logger.info("Unchanged after evaluation: %s", image_path)
+            continue
 
         region_info_payload: Optional[Dict[str, Any]]
         if final_region_info:
@@ -570,11 +748,11 @@ def write_pass(
 
         with open(write_args_file, "w", encoding="utf-8", newline="\n") as handle:
             for image_path, subjects, region_info in write_tasks:
-                
+
                 # ExifTool flag to clear all existing Subject values explicitly before inserting new ones.
                 handle.write("-Subject=\n")
-                
-                # Appends each new subject value one by one to a list tag. 
+
+                # Appends each new subject value one by one to a list tag.
                 for subject in subjects:
                     handle.write(f"-Subject={subject}\n")
 
@@ -608,13 +786,14 @@ def write_pass(
 
                 # Provide the target image path ExifTool needs to operate on for this block
                 handle.write(f"{image_path}\n")
-                
+
                 # Resets arguments for the next file iteration and forces immediate execution of the block above
                 handle.write("-execute\n")
 
-        logger.debug("--- CONTENTS OF WRITE ARGUMENT FILE ---")
-        with open(write_args_file, "r", encoding="utf-8") as debug_handle:
-            logger.debug("\n%s---------------------------------------", debug_handle.read())
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("--- CONTENTS OF WRITE ARGUMENT FILE ---")
+            with open(write_args_file, "r", encoding="utf-8") as debug_handle:
+                logger.debug("\n%s---------------------------------------", debug_handle.read())
 
         command = build_exiftool_command(
             write_args_file,
