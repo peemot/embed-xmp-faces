@@ -123,3 +123,13 @@ The audit log includes per-file decisions such as:
 - The script scans directories recursively.
 - If a sidecar has no usable `Subject` or `RegionInfo` after normalization, that pair is skipped.
 - `AppliedToDimensions` is taken from the sidecar when present, otherwise from the image metadata.
+
+## Tests
+
+From the project directory, run:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The tests use only the Python standard library. Most tests simulate ExifTool and do not change images. If ExifTool is on `PATH`, an additional integration test creates a synthetic PNG and XMP sidecar in a temporary directory and verifies a real metadata round trip; otherwise that test is skipped.
